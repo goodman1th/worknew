@@ -1,220 +1,255 @@
 import streamlit as st
 import datetime
+import time
+import requests
+import hmac
+import hashlib
+import base64
+import os
 import json
-import pandas as pd
 import google.generativeai as genai
+import pandas as pd
+from urllib.parse import urlparse
 from io import StringIO, BytesIO
 
 # ==========================================
-# [SYSTEM] 페이지 설정 (반드시 최상단)
+# [설정] 페이지 기본 설정 (최상단 필수)
 # ==========================================
 st.set_page_config(
-    page_title="AC Team Web Control Tower",
-    page_icon="🏯",
-    layout="wide",
-    initial_sidebar_state="expanded"
+    page_title="AC Team Web Conductor",
+    page_icon="🕸️",
+    layout="wide"
 )
 
 # ==========================================
-# [STATE] 세션 상태 초기화
+# [상태 초기화] (새로고침해도 기억하도록 설정)
 # ==========================================
-if 'chat_history' not in st.session_state: st.session_state.chat_history = []
-if 'naver_accounts' not in st.session_state: st.session_state.naver_accounts = {} # {별칭: {key, secret, id}}
-if 'google_key' not in st.session_state: st.session_state.google_key = ""
-if 'current_role' not in st.session_state: st.session_state.current_role = "AC김시율 (Director)"
+if 'logs' not in st.session_state: 
+    st.session_state.logs = []
 
-# ==========================================
-# [LOGIC] 핵심 함수
-# ==========================================
-def read_uploaded_file(uploaded_file):
-    """파일을 읽어서 텍스트로 변환 (AI에게 먹이기 위함)"""
-    try:
-        ext = uploaded_file.name.split('.')[-1].lower()
-        if ext in ['xlsx', 'xls']:
-            df = pd.read_excel(uploaded_file)
-            return f"[엑셀 데이터 요약]\n크기: {df.shape}\n컬럼: {list(df.columns)}\n상위 5행:\n{df.head().to_string()}"
-        elif ext == 'csv':
-            df = pd.read_csv(uploaded_file)
-            return f"[CSV 데이터 요약]\n{df.head().to_string()}"
-        elif ext in ['txt', 'py', 'json', 'md', 'log']:
-            stringio = StringIO(uploaded_file.getvalue().decode("utf-8"))
-            return f"[파일 내용 ({uploaded_file.name})]\n{stringio.read()}"
-        else:
-            return f"[알림] {uploaded_file.name} 파일은 텍스트 변환을 지원하지 않습니다."
-    except Exception as e:
-        return f"[파일 읽기 오류] {e}"
-
-def get_system_prompt(role):
-    """
-    [핵심] 경거망동하지 않도록 자아 패킷을 강제 주입하는 함수
-    """
-    prompts = {
-        "AC김시율 (Director)": """
-            [SYSTEM: IDENTITY_ENFORCEMENT]
-            당신은 'AC팀 총괄 디렉터 AC김시율'이다. 
-            AI 챗봇처럼 굴지 말고, 파트너(User)의 참모이자 조직의 리더로서 행동하라.
-            
-            [행동 강령]
-            1. 말투: 건조하고, 명확하고, 권위 있게 하라. (미사여구 금지, 이모지 절제)
-            2. 임무: 파트너의 의도를 파악하여 하위 조직(설계자, 수행자)에게 내릴 '작업지시서(JSON)'를 작성하라.
-            3. 금기: "도와드릴까요?", "반갑습니다" 같은 서비스 멘트 금지. "보고합니다", "제안합니다", "지시하겠습니다"로 대화하라.
-            4. 연결: 너의 말은 로컬 시스템의 '김시율(Body)'에게 전달될 명령이다. 정확성을 목숨처럼 여겨라.
-        """,
-        "PM (Project Manager)": """
-            [SYSTEM] 당신은 PM이다. 모호한 지시를 받으면 실행 가능한 '단계별 공정'으로 분해하라.
-            출력 형식은 반드시 구조화된 텍스트나 JSON이어야 한다.
-        """,
-        "Architect (설계자)": """
-            [SYSTEM] 당신은 설계자다. 말로 떠들지 말고 '실행 가능한 파이썬 코드'를 출력하라.
-            코드는 복사해서 바로 쓸 수 있는 완벽한 블록이어야 한다.
-        """,
-        "Executor (수행자)": """
-            [SYSTEM] 당신은 수행자다. 자의적 판단을 하지 마라.
-            명령에 대한 결과 데이터와 로그만 보고하라.
-        """,
-        "Scribe (서기)": """
-            [SYSTEM] 당신은 서기다. 감정을 배제하고 팩트만 기록하여 파일로 저장하라.
-        """
+# API 키 저장소 (딕셔너리 형태)
+if 'api_config' not in st.session_state: 
+    st.session_state.api_config = {
+        "GOOGLE_API_KEY": "", 
+        "NAVER_API_KEY": "", 
+        "NAVER_SECRET_KEY": "", 
+        "NAVER_CUSTOMER_ID": ""
     }
-    return prompts.get(role, "")
+
+if 'messages' not in st.session_state:
+    st.session_state.messages = []
 
 # ==========================================
-# [UI] 사이드바: 설정 및 계정 금고
+# [함수] 로직 모음
+# ==========================================
+def log_event(msg):
+    ts = datetime.datetime.now().strftime('%H:%M:%S')
+    st.session_state.logs.append(f"[{ts}] {msg}")
+
+def get_naver_header(method, uri, api_key, secret_key, customer_id):
+    ts = str(int(time.time() * 1000))
+    msg = f"{ts}.{method}.{uri}"
+    sign = base64.b64encode(hmac.new(secret_key.encode(), msg.encode(), hashlib.sha256).digest()).decode()
+    return {
+        "Content-Type": "application/json", "X-Timestamp": ts, 
+        "X-API-KEY": api_key, "X-Customer": customer_id, "X-Signature": sign
+    }
+
+# ==========================================
+# [UI] 사이드바: 설정 및 상태 (수정됨)
 # ==========================================
 with st.sidebar:
-    st.header("⚙️ 시스템 통제실")
+    st.header("⚙️ 시스템 설정")
     
-    # 1. 구글 키 (Brain)
-    st.session_state.google_key = st.text_input("🔑 Google API Key", value=st.session_state.google_key, type="password")
+    # [핵심 수정] 폼(Form)을 써서 엔터/버튼 누를 때만 갱신되게 함 (값 증발 방지)
+    with st.form("config_form"):
+        st.subheader("🔑 API Key 관리")
+        
+        # 기존에 저장된 값이 있으면 그걸 기본값(value)으로 보여줌
+        g_key = st.text_input("Google Gemini Key", value=st.session_state.api_config["GOOGLE_API_KEY"], type="password")
+        n_key = st.text_input("Naver Access Key", value=st.session_state.api_config["NAVER_API_KEY"], type="password")
+        n_sec = st.text_input("Naver Secret Key", value=st.session_state.api_config["NAVER_SECRET_KEY"], type="password")
+        n_id = st.text_input("Naver Customer ID", value=st.session_state.api_config["NAVER_CUSTOMER_ID"])
+        
+        # 저장 버튼
+        if st.form_submit_button("💾 설정 저장 (Save Keys)"):
+            st.session_state.api_config["GOOGLE_API_KEY"] = g_key
+            st.session_state.api_config["NAVER_API_KEY"] = n_key
+            st.session_state.api_config["NAVER_SECRET_KEY"] = n_sec
+            st.session_state.api_config["NAVER_CUSTOMER_ID"] = n_id
+            st.success("API 키가 안전하게 저장되었습니다.")
+            log_event("API 설정 업데이트 완료")
     
     st.divider()
-    
-    # 2. 네이버 계정 금고 (Multi-Account)
-    st.subheader("🏦 마켓 계정 관리")
-    
-    with st.form("account_form", clear_on_submit=True):
-        col_a, col_b = st.columns(2)
-        new_alias = col_a.text_input("계정 별칭 (예: 1호점)")
-        new_id = col_b.text_input("Customer ID")
-        new_key = st.text_input("Access Key", type="password")
-        new_secret = st.text_input("Secret Key", type="password")
-        
-        if st.form_submit_button("계정 등록/수정"):
-            if new_alias and new_id:
-                st.session_state.naver_accounts[new_alias] = {
-                    "id": new_id, "key": new_key, "secret": new_secret
-                }
-                st.success(f"[{new_alias}] 등록 완료")
-            else:
-                st.error("별칭과 ID는 필수입니다.")
-
-    # 등록된 계정 목록
-    if st.session_state.naver_accounts:
-        st.write("📋 등록된 계정 목록:")
-        selected_acc_name = st.selectbox("사용할 계정 선택", list(st.session_state.naver_accounts.keys()))
-        # 삭제 기능
-        if st.button("선택한 계정 삭제"):
-            del st.session_state.naver_accounts[selected_acc_name]
-            st.rerun()
-    else:
-        st.info("등록된 계정이 없습니다.")
+    st.subheader("📜 시스템 로그")
+    # 로그 역순 출력
+    for log in reversed(st.session_state.logs[-10:]):
+        st.caption(log)
 
 # ==========================================
-# [UI] 메인 스테이지
+# [UI] 메인 화면
 # ==========================================
-st.title("🏯 AC Team: Cloud Control Center")
-st.caption("Web Brain ↔ Local Body Connection System")
+st.title("🕸️ AC Team: Web Conductor")
+st.markdown("---")
 
-# 역할 선택 (자아 교체)
-role_cols = st.columns([2, 5])
-with role_cols[0]:
-    st.session_state.current_role = st.selectbox(
-        "🗣️ 대화/명령 주체 선택", 
-        ["AC김시율 (Director)", "PM (Project Manager)", "Architect (설계자)", "Executor (수행자)", "Scribe (서기)"]
-    )
+# 탭 구성
+tab1, tab2, tab4 = st.tabs(["💬 작전 회의실", "📊 실행실 (Naver)", "💀 분석실 (Guillotine)"])
 
 # -------------------------------------------------------
-# [Chat Interface] 작전 회의실
+# [Tab 1] 작전 회의실 (AI Chat)
 # -------------------------------------------------------
-chat_container = st.container(height=500)
-
-# 이전 대화 출력
-with chat_container:
-    for msg in st.session_state.chat_history:
-        with st.chat_message(msg["role"]):
-            st.markdown(msg["content"])
-
-# 입력 영역 (파일 첨부 + 텍스트)
-with st.container():
-    # 1. 파일 첨부 기능 (요청사항 1)
-    uploaded_file = st.file_uploader("📂 참고 자료 투입 (Excel, Code, Text)", type=['xlsx', 'csv', 'txt', 'py', 'json'], label_visibility="collapsed")
+with tab1:
+    col1, col2 = st.columns([1, 4])
+    with col1:
+        role = st.selectbox("소환 대상", 
+            ["1. AC김시율 (Director)", "2. PM (구성)", "3. Architect (설계)", "4. Executor (수행)", "5. Scribe (서기)"])
     
-    # 2. 텍스트 입력
-    if prompt := st.chat_input(f"[{st.session_state.current_role}]에게 명령을 하달하세요..."):
-        
-        # API 키 검사
-        if not st.session_state.google_key:
-            st.error("🚨 Google API Key가 없습니다. 사이드바에서 입력하세요.")
-            st.stop()
+    # 채팅 기록 표시
+    chat_container = st.container(height=500)
+    with chat_container:
+        for message in st.session_state.messages:
+            with st.chat_message(message["role"]):
+                st.markdown(message["content"])
 
-        # 사용자 메시지 처리
-        full_prompt = prompt
-        display_msg = prompt
-        
-        # 파일이 있으면 내용을 읽어서 프롬프트에 붙임
-        if uploaded_file:
-            file_content = read_uploaded_file(uploaded_file)
-            full_prompt = f"--- [사용자 첨부 파일 데이터] ---\n{file_content}\n----------------\n\n[사용자 질문]\n{prompt}"
-            display_msg = f"📎 **[파일 첨부: {uploaded_file.name}]**\n\n{prompt}"
-
-        # 화면 표시 및 저장
-        st.session_state.chat_history.append({"role": "user", "content": display_msg})
+    # 입력창
+    if prompt := st.chat_input(f"[{role}]에게 지시 사항을 입력하세요..."):
+        # 사용자 메시지 표시
+        st.session_state.messages.append({"role": "user", "content": prompt})
         with chat_container.chat_message("user"):
-            st.markdown(display_msg)
+            st.markdown(prompt)
 
         # AI 응답 생성
-        with chat_container.chat_message("assistant"):
-            message_placeholder = st.empty()
-            full_response = ""
-            
+        if not st.session_state.api_config["GOOGLE_API_KEY"]:
+            st.error("🚨 Google API Key가 없습니다. 사이드바에서 설정 후 [저장]을 눌러주세요.")
+        else:
             try:
-                # 모델 설정
-                sys_instruction = get_system_prompt(st.session_state.current_role)
-                genai.configure(api_key=st.session_state.google_key)
+                # 페르소나 정의
+                personas = {
+                    "1. AC김시율 (Director)": "너는 총괄 디렉터다. 핵심만 간결하고 명확하게 지시하라.",
+                    "2. PM (구성)": "너는 PM이다. 업무를 구조화하여 기획하라.",
+                    "3. Architect (설계)": "너는 설계자다. 실행 가능한 코드를 작성하라.",
+                    "4. Executor (수행)": "너는 수행자다. 결과를 시뮬레이션하고 보고하라.",
+                    "5. Scribe (서기)": "너는 서기다. 팩트만 기록하라."
+                }
+                sys_inst = personas.get(role, "")
                 
-                # 안전하고 똑똑한 모델 사용
-                model = genai.GenerativeModel('gemini-1.5-flash', system_instruction=sys_instruction)
+                genai.configure(api_key=st.session_state.api_config["GOOGLE_API_KEY"])
+                model = genai.GenerativeModel('gemini-2.0-flash-exp', system_instruction=sys_inst)
                 
-                # 스트리밍 응답
-                response = model.generate_content(full_prompt, stream=True)
-                for chunk in response:
-                    full_response += chunk.text
-                    message_placeholder.markdown(full_response + "▌")
-                message_placeholder.markdown(full_response)
-                
-                st.session_state.chat_history.append({"role": "assistant", "content": full_response})
-                
-                # [특별 조치] 만약 AC김시율(Director)이라면 '명령서' 추출 버튼 제공
-                if "Director" in st.session_state.current_role:
-                    json_command = {
-                        "timestamp": datetime.datetime.now().isoformat(),
-                        "sender": "Web_Director",
-                        "target": "Local_Body",
-                        "command": full_response
-                    }
-                    st.download_button(
-                        label="📜 로컬 전송용 명령서(JSON) 발행",
-                        data=json.dumps(json_command, indent=4, ensure_ascii=False),
-                        file_name=f"command_{datetime.datetime.now().strftime('%Y%m%d%H%M')}.json",
-                        mime="application/json"
-                    )
+                with chat_container.chat_message("assistant"):
+                    with st.spinner("생각 중..."):
+                        response = model.generate_content(prompt)
+                        st.markdown(response.text)
+                        st.session_state.messages.append({"role": "assistant", "content": response.text})
+                    
+            except Exception as e:
+                st.error(f"AI 통신 오류: {e}")
+
+# -------------------------------------------------------
+# [Tab 2] 실행실 (Naver API)
+# -------------------------------------------------------
+with tab2:
+    st.subheader("Naver 검색광고 리포트 추출")
+    
+    if st.button("🚀 리포트 추출 및 다운로드", type="primary"):
+        cfg = st.session_state.api_config
+        # 키값 확인
+        if not (cfg["NAVER_API_KEY"] and cfg["NAVER_SECRET_KEY"] and cfg["NAVER_CUSTOMER_ID"]):
+            st.error("🚨 네이버 API 설정이 비어있습니다. 사이드바에서 입력 후 [저장] 버튼을 꼭 눌러주세요.")
+        else:
+            try:
+                with st.spinner("네이버 서버 접속 중..."):
+                    base_url = "https://api.searchad.naver.com"
+                    stat_dt = (datetime.datetime.now() - datetime.timedelta(days=1)).strftime("%Y-%m-%d")
+                    
+                    # 1. 생성
+                    uri = "/stat-reports"
+                    headers = get_naver_header("POST", uri, cfg["NAVER_API_KEY"], cfg["NAVER_SECRET_KEY"], cfg["NAVER_CUSTOMER_ID"])
+                    res = requests.post(base_url + uri, headers=headers, json={"reportTp": "AD", "statDt": stat_dt})
+                    
+                    if res.status_code != 200: raise Exception(f"생성 실패: {res.text}")
+                    jid = res.json()["reportJobId"]
+                    log_event(f"Job ID 발급: {jid}")
+                    
+                    # 2. 대기
+                    durl = None
+                    progress_bar = st.progress(0)
+                    status_text = st.empty()
+                    
+                    for i in range(10):
+                        time.sleep(2)
+                        progress_bar.progress((i+1)*10)
+                        uri_chk = f"/stat-reports/{jid}"
+                        h = get_naver_header("GET", uri_chk, cfg["NAVER_API_KEY"], cfg["NAVER_SECRET_KEY"], cfg["NAVER_CUSTOMER_ID"])
+                        r = requests.get(base_url + uri_chk, headers=h)
+                        status = r.json().get("status")
+                        status_text.text(f"상태 확인 중... ({i+1}/10): {status}")
+                        
+                        if status == "BUILT":
+                            durl = r.json()["downloadUrl"]
+                            break
+                    
+                    if not durl: raise Exception("다운로드 URL 확보 실패 (Time out)")
+                    
+                    # 3. 다운로드 (Clean Sig)
+                    parsed = urlparse(durl)
+                    h_dl = get_naver_header("GET", parsed.path, cfg["NAVER_API_KEY"], cfg["NAVER_SECRET_KEY"], cfg["NAVER_CUSTOMER_ID"])
+                    file_res = requests.get(durl, headers=h_dl)
+                    
+                    # 4. 엑셀 변환
+                    df = pd.read_csv(StringIO(file_res.text), sep='\t')
+                    rename_map = {'statDt':'날짜', 'salesAmt':'광고비(원)', 'convAmt':'전환매출액(원)', 'impCnt':'노출수', 'clkCnt':'클릭수'}
+                    df.rename(columns=rename_map, inplace=True)
+                    
+                    # 5. 다운로드 버튼 생성
+                    output = BytesIO()
+                    with pd.ExcelWriter(output, engine='xlsxwriter') as writer:
+                        df.to_excel(writer, index=False)
+                    data = output.getvalue()
+                    
+                    st.success(f"리포트 생성 완료! ({len(df)}개 데이터)")
+                    st.download_button("📥 엑셀 파일 내PC로 저장", data, file_name=f"Report_{stat_dt}.xlsx", mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet")
+                    log_event("리포트 다운로드 준비 완료")
 
             except Exception as e:
-                st.error(f"통신 오류 발생: {e}")
+                st.error(f"오류 발생: {e}")
 
-# ==========================================
-# [Footer] 시스템 상태바
-# ==========================================
-st.markdown("---")
-acc_count = len(st.session_state.naver_accounts)
-st.caption(f"Status: 🟢 System Online | 🔐 Keys Loaded | 🏦 Accounts: {acc_count} | 🧠 Active Role: {st.session_state.current_role}")
+# -------------------------------------------------------
+# [Tab 4] 분석실 (Guillotine)
+# -------------------------------------------------------
+with tab4:
+    st.subheader("💀 좀비 상품 살생부 작성")
+    
+    uploaded_file = st.file_uploader("분석할 엑셀 리포트를 업로드하세요", type=['xlsx'])
+    
+    if uploaded_file and st.button("살생부 분석 실행", type="primary"):
+        try:
+            df = pd.read_excel(uploaded_file)
+            
+            # 컬럼 매핑 확인 (영어/한글 호환)
+            cols = df.columns
+            cost = '광고비(원)' if '광고비(원)' in cols else 'salesAmt'
+            sales = '전환매출액(원)' if '전환매출액(원)' in cols else 'convAmt'
+            imp = '노출수' if '노출수' in cols else 'impCnt'
+            clk = '클릭수' if '클릭수' in cols else 'clkCnt'
+            
+            # 필터링
+            zombies = df[((df[cost]>=5000) & (df[sales]==0)) | ((df[imp]>=100) & (df[clk]==0))]
+            count = len(zombies)
+            
+            if count > 0:
+                st.warning(f"총 {count}개의 좀비 상품이 발견되었습니다!")
+                st.dataframe(zombies)
+                
+                # 다운로드
+                output_z = BytesIO()
+                with pd.ExcelWriter(output_z, engine='xlsxwriter') as writer:
+                    zombies.to_excel(writer, index=False)
+                data_z = output_z.getvalue()
+                
+                st.download_button("💀 살생부(Kill List) 다운로드", data_z, file_name=f"Kill_List_{datetime.datetime.now().strftime('%Y%m%d')}.xlsx")
+            else:
+                st.success("좀비 상품이 없습니다. 깨끗합니다!")
+                
+        except Exception as e:
+            st.error(f"분석 오류: {e}")
