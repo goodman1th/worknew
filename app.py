@@ -45,24 +45,32 @@ def get_naver_header(method, uri, api_key, secret_key, customer_id):
 import time # time 모듈 추가
 
 # ==========================================
-# [UI] 사이드바: 설정 및 상태
+# [UI] 사이드바: 설정 및 상태 (수정됨)
 # ==========================================
 with st.sidebar:
     st.header("⚙️ 시스템 설정")
     
-    # API 키 입력 (Streamlit Secrets를 쓰면 더 안전하지만, 일단 UI 입력 방식 유지)
-    with st.expander("API Key 관리", expanded=True):
-        st.session_state.api_config["GOOGLE_API_KEY"] = st.text_input("Google Gemini Key", type="password")
-        st.session_state.api_config["NAVER_API_KEY"] = st.text_input("Naver Access Key", type="password")
-        st.session_state.api_config["NAVER_SECRET_KEY"] = st.text_input("Naver Secret Key", type="password")
-        st.session_state.api_config["NAVER_CUSTOMER_ID"] = st.text_input("Naver Customer ID")
-    
+    with st.form("api_config_form"): # 폼(Form)으로 감싸서 엔터/버튼으로 저장
+        st.subheader("API Key 관리")
+        
+        # 기존 값 불러오기 (없으면 빈카ん)
+        g_key = st.text_input("Google Gemini Key", value=st.session_state.api_config.get("GOOGLE_API_KEY", ""), type="password")
+        n_key = st.text_input("Naver Access Key", value=st.session_state.api_config.get("NAVER_API_KEY", ""), type="password")
+        n_sec = st.text_input("Naver Secret Key", value=st.session_state.api_config.get("NAVER_SECRET_KEY", ""), type="password")
+        n_id = st.text_input("Naver Customer ID", value=st.session_state.api_config.get("NAVER_CUSTOMER_ID", ""))
+        
+        # [저장 버튼]
+        if st.form_submit_button("💾 설정 저장 (Save Config)"):
+            st.session_state.api_config["GOOGLE_API_KEY"] = g_key
+            st.session_state.api_config["NAVER_API_KEY"] = n_key
+            st.session_state.api_config["NAVER_SECRET_KEY"] = n_sec
+            st.session_state.api_config["NAVER_CUSTOMER_ID"] = n_id
+            st.success("API 키가 저장되었습니다!")
+            
     st.divider()
     st.subheader("📜 시스템 로그")
-    # 로그를 역순으로 출력 (최신이 위로)
     for log in reversed(st.session_state.logs[-10:]):
         st.caption(log)
-
 # ==========================================
 # [UI] 메인 화면
 # ==========================================
